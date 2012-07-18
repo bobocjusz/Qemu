@@ -1484,7 +1484,7 @@ static ssize_t nic_receive(VLANClientState *vc, const uint8_t * buf, size_t size
         assert(!(s->configuration[21] & BIT(3)));
         int mcast_idx = compute_mcast_idx(buf);
         if (!(s->mult[mcast_idx >> 3] & (1 << (mcast_idx & 7)))) {
-            return size;
+            //return size;
         }
         rfd_status |= 0x0002;
     } else if (s->configuration[15] & 1) {

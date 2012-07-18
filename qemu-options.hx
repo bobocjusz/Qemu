@@ -782,6 +782,16 @@ DEF("net", HAS_ARG, QEMU_OPTION_net,
     "                connect the user mode network stack to VLAN 'n', configure its\n"
     "                DHCP server and enabled optional services\n"
 #endif
+	"-net udp[,vlan=n]sport=sport,dport=dport,daddr=host\n"
+	"                connect the vlan 'n' to a udp host (for dynamips/pemu/GNS3)\n"
+#ifndef _WIN32
+	"-net lcap[,vlan=n]ifname=name\n"
+	"                connects the vlan 'n' to a physical port using the lcap library\n"
+#endif
+#ifdef CONFIG_PCAP
+	"-net pcap[,vlan=n]ifname=name\n"
+	"                connects the vlan 'n' to a physical port using the pcap library (possibly faster)\n"
+#endif
 #ifdef _WIN32
     "-net tap[,vlan=n][,name=str],ifname=name\n"
     "                connect the host TAP network interface to VLAN 'n'\n"

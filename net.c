@@ -101,6 +101,11 @@
 #include <libvdeplug.h>
 #endif
 
+#if defined(CONFIG_PCAP)
+#include <pcap.h>
+#define MAC_CAP_LEN 2000
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <malloc.h>
@@ -2238,6 +2243,381 @@ static int net_socket_mcast_init(VLANState *vlan,
 
 }
 
+typedef struct DUDPState {
+	VLANClientState *vc;
+	int rfd;
+	struct sockaddr_in sender;
+} DUDPState;
+
+// Called when packet is received
+static void dudp_send (void *opaque) { 
+	DUDPState *s=opaque;
+	uint8_t buf[4096];
+	int size;
+	
+	//printf ("dudp_send()     ");
+	size = recvfrom(s->rfd,buf,sizeof(buf),0,NULL,NULL);
+	//printf ("Receiving packet size=%i\n",size);
+	if (size > 0) {
+		qemu_send_packet(s->vc, buf, size);
+	}
+}
+
+// Called when packet is sended
+static ssize_t dudp_receive(VLANClientState *vc, const uint8_t *buf, size_t size) {
+	DUDPState *s = vc->opaque;
+	int res;
+	
+	//printf ("dusp_receive(). Sending   packet size=%i)\n", (int)size);
+	res = sendto(s->rfd, buf, size, 0, (struct sockaddr *)&s->sender, sizeof (s->sender));
+	return res;
+}
+
+static int net_dudp_init(VLANState *vlan, const char *model, const char *name,
+						 int lport, char *rhost, int rport) {
+	DUDPState *s;
+	struct sockaddr_in receiver;
+	int res;
+	
+	s=qemu_mallocz(sizeof(DUDPState));
+	if (!s) {
+		return -1;
+	}
+
+	printf ("\nnet_dudp_init(%i,%s,%i)\n", lport, rhost, rport);
+	
+	s->rfd=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+	
+	receiver.sin_family=AF_INET;
+	receiver.sin_addr.s_addr=INADDR_ANY;
+	receiver.sin_port=htons(lport);
+	res=bind(s->rfd, (struct sockaddr *)&receiver, sizeof (receiver));
+	
+	if (res == -1) {
+		fprintf (stderr,"bind error:%s\n",strerror(errno));
+		return res;
+	}
+
+	memset ((char*)&s->sender,sizeof(s->sender),0);
+	s->sender.sin_family=AF_INET;
+	s->sender.sin_port=htons(rport);
+	inet_aton(rhost,&s->sender.sin_addr);
+	
+	s->vc= qemu_new_vlan_client(vlan, model, name, NULL, dudp_receive, NULL, NULL, s);
+	
+	qemu_set_fd_handler(s->rfd, dudp_send, NULL, s);
+	snprintf(s->vc->info_str, sizeof(s->vc->info_str),"dcap: %i->%s:%i",lport,rhost,rport);
+	return 0;
+}
+
+#ifndef _WIN32
+typedef struct LCAPState {
+	VLANClientState *vc;
+	int fd;
+	struct sockaddr from;
+	socklen_t fromlen;
+	struct sockaddr to;
+	int tolen;
+} LCAPState;
+
+static int lcap_interface_init(char *device) {
+	int fd;
+	struct ifreq ifr;
+
+	fd = socket(PF_INET, SOCK_RAW, htons(0x0003));
+
+	if (fd<0) {
+		return 0;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strcpy(ifr.ifr_name,device);
+	
+	if (ioctl(fd, SIOCGIFFLAGS, &ifr) < 0 ) { 
+		return 0;
+	}
+	
+	ifr.ifr_flags |= IFF_PROMISC;
+	
+	if (ioctl(fd, SIOCSIFFLAGS, &ifr) < 0 ) {
+		return 0;
+	}
+
+	return fd;
+}
+
+static void lcap_send (void *opaque) {
+	LCAPState *s = opaque;
+	uint8_t buf[4096];
+	int size;
+
+	s->fromlen = sizeof(s->from);
+	size = recvfrom(s->fd, buf, sizeof(buf), MSG_DONTWAIT, &s->from, &s->fromlen);
+	if (size > 0) {
+		qemu_send_packet(s->vc, buf, size);
+	}
+} 
+
+static ssize_t lcap_receive(VLANClientState *vc, const uint8_t *buf, size_t size) {
+	LCAPState *s = vc->opaque;
+	int ret;
+
+	ret = sendto(s->fd, buf, size, 0, &s->to, s->tolen);
+	return ret;
+}
+
+static int net_lcap_init(VLANState *vlan, const char *ifname) {
+	char ifname1[64];
+	int fd;
+	LCAPState *s;
+
+	if (ifname) {
+		strcpy(ifname1,ifname);
+	}
+	else {
+		strcpy (ifname1,"eth0");
+	}
+
+	fd=lcap_interface_init(ifname1);
+	
+	if (!fd) {
+		fprintf (stderr,"lcap_interface_init returns error\n");
+		return -1;
+	}
+
+	s = qemu_mallocz(sizeof(LCAPState));
+	if (!s) {
+		return -1;
+	}
+
+	memset(&s->to, 0, sizeof(s->to));
+	s->to.sa_family = AF_INET;
+	strcpy(s->to.sa_data, ifname1);
+	s->tolen=sizeof(s->to);
+
+	s->fromlen=sizeof(struct sockaddr);
+	s->fd=fd;
+	s->vc= qemu_new_vlan_client(vlan, ifname, NULL, NULL, lcap_receive, NULL, NULL, s);
+	qemu_set_fd_handler(s->fd, lcap_send, NULL, s);
+	snprintf(s->vc->info_str, sizeof(s->vc->info_str),"lcap: ifname=%s", ifname);
+	return 0;
+}
+#endif /* _WIN32 */
+
+#ifdef CONFIG_PCAP
+
+/* Max number of PCAP captures */
+#define MAX_CAP_LEN 2000
+
+#ifdef _WIN32
+
+typedef struct clone_struct {
+	int socket_fd;
+	pcap_t *pfd;
+	struct sockaddr_in sender;
+	int pkt_size;
+	unsigned char pkt_buf[MAX_CAP_LEN];
+} clone_struct;
+#endif
+
+typedef struct PCAPState {
+	VLANClientState *vc;
+	int fd;
+	pcap_t *pfd;
+	char devname[128];
+#ifdef _WIN32
+	clone_struct cs;
+#endif
+} PCAPState;
+
+#ifdef _WIN32
+static int port_add=0;
+
+static DWORD WINAPI pcap_thread(LPVOID x) {
+	clone_struct *cs = x;
+	struct pcap_pkthdr *h;
+	const unsigned char *pkt_data;
+	int status;
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+	while (1) {
+		if (cs->pkt_size == 0) {
+			status=pcap_next_ex (cs->pfd,&h,&pkt_data);
+			if (status==1) {
+				int sz=h->caplen;
+				if (pkt_data==0 || sz==0) {
+					continue;
+				}
+				if(sz > MAX_CAP_LEN) {
+					sz = MAX_CAP_LEN;
+				}
+				memcpy(cs->pkt_buf,pkt_data,sz);
+				cs->pkt_size=sz;
+				sendto(cs->socket_fd,pkt_data,1,0, (struct sockaddr *)&cs->sender, sizeof (cs->sender));
+			}
+		} else {
+			Sleep(1);
+		}
+	}
+}
+
+static int create_pcap_thread(PCAPState *s) {
+	struct sockaddr_in receiver;
+	int port;
+	DWORD thread_id;
+
+	port = 6 * getpid() + port_add++;
+	while (port > 2000) {
+		port -= 2000;
+	}
+	port += 60000;
+
+	s->fd=socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	memset ((char*)&receiver, sizeof(receiver),0);
+	receiver.sin_family = AF_INET;
+	receiver.sin_port = port;
+	inet_aton("127.0.0.1", &receiver.sin_addr);
+	bind(s->fd,(struct sockaddr *) &receiver,sizeof (receiver));
+	memset ((char*)&s->cs.sender,sizeof(s->cs.sender),0);
+	s->cs.sender.sin_family = AF_INET;
+	s->cs.sender.sin_port = htons(port);
+	inet_aton("127.0.0.1", &s->cs.sender.sin_addr);
+	s->cs.socket_fd = s->fd;
+	s->cs.pkt_size = 0;
+	s->cs.pfd = s->pfd;
+	CreateThread(NULL,0,pcap_thread,(LPVOID)&s->cs,0,&thread_id);
+	return s->fd;
+}
+#endif /* _WIN32 */
+
+static void pcap_print_interfaces(void) {
+	char errbuf[PCAP_ERRBUF_SIZE];
+	pcap_if_t *alldevs, *d;
+	int i = 0;
+
+	if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+		printf("Error in pcap_findalldevs: %s\n", errbuf);
+		exit(1);
+	}
+	
+	for(d = alldevs; d; d = d->next) {
+		printf("%d. ", ++i);
+
+		if (d->name) {
+			printf("%s ", d->name);
+		}
+		else {
+			printf("(No name) ");
+		}
+		
+		if (d->description) {
+			printf("%s\n", d->description);
+		}
+		else {
+			printf("(No description)\n");
+		}
+	}
+	if (i == 0) {
+		printf("\nNo interfaces found!\n");
+	}
+}
+
+static pcap_t *pcap_interface_init(char *device) {
+	pcap_if_t *alldevs, *d;
+	int i = 0, did;
+	char errbuf[PCAP_ERRBUF_SIZE];
+
+	if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+		fprintf(stderr,"Error in pcap_findalldevs: %s\n", errbuf);
+		exit(1);
+	}
+
+	did = atoi(device);
+
+	if (did == 0) { // Device is specified by name
+		for(d = alldevs; d; d = d->next) {
+			if (strcmp(d->name, device)==0) {
+				break;
+			}
+		}
+	} else {
+		for(d = alldevs, i = 0; i< did - 1 ;d = d->next, i++);
+	}
+	
+	if (d == 0) {
+		return 0;
+	}
+	printf ("Selected Device: %s (%s)\n", d->name, d->description);
+	return pcap_open_live(d->name, MAX_CAP_LEN, 1, 1, errbuf);
+}
+
+static void pcap_send (void *opaque) {
+	PCAPState *s = opaque;
+	
+	//printf("Receiving packet\n");
+#ifdef _WIN32
+	unsigned char tmp[100];
+	int size;
+	size=recvfrom(s->fd, tmp, sizeof(tmp), 0, NULL, NULL); // Clear socket data
+
+	if (s->cs.pkt_size) {
+		qemu_send_packet(s->vc, s->cs.pkt_buf, s->cs.pkt_size);
+		s->cs.pkt_size = 0;
+	} 
+#else
+	const unsigned char *buf;
+	struct pcap_pkthdr *h;
+	int size, i;
+	i = pcap_next_ex (s->pfd,&h,&buf);
+	size = h->caplen;
+	if (i == 1) {
+		qemu_send_packet(s->vc, buf, size);
+	}
+#endif
+}
+
+int wtf = 0; //?? from qemu pcap implementation - for some reason they drop first packet
+
+static ssize_t pcap_receive(VLANClientState *vc, const uint8_t *buf, size_t size) {
+	PCAPState *s = vc->opaque;
+	int res = 0;
+
+	//printf("Sending packet\n");
+	if (wtf) {
+		res = pcap_sendpacket(s->pfd, buf, size);
+	}
+	else {
+		wtf = 1;
+	}
+	return res;
+}
+
+static int net_pcap_init(VLANState *vlan, char *ifname) {
+	PCAPState *s;
+	
+	s = qemu_mallocz(sizeof(PCAPState));
+	s->pfd = pcap_interface_init(ifname);
+
+	if (s->pfd == 0) {
+		printf("Error Initialising interface %s\n", ifname);
+		printf("Check you have the correct rights or use a valid interface\n");
+		printf("Valid Interfaces:\n");
+		pcap_print_interfaces();
+		printf("Use interface name or it's number in ifname argument\n");
+		exit(0);
+	}
+#ifdef _WIN32
+	create_pcap_thread(s);
+#else
+	s->fd = pcap_get_selectable_fd(s->pfd);
+#endif
+	s->vc = qemu_new_vlan_client(vlan, ifname, ifname, NULL, pcap_receive, NULL, NULL, s);
+	snprintf(s->vc->info_str, sizeof(s->vc->info_str), "pcap: ifname=%s", ifname);
+	qemu_set_fd_handler(s->fd, pcap_send, NULL, s);
+	return 0;
+} 
+#endif /* CONFIG_PCAP */
+
 typedef struct DumpState {
     VLANClientState *pcap_vc;
     int fd;
@@ -2800,7 +3180,54 @@ int net_client_init(Monitor *mon, const char *device, const char *p)
 	ret = net_vde_init(vlan, device, name, vde_sock, vde_port, vde_group, vde_mode);
     } else
 #endif
-    if (!strcmp(device, "dump")) {
+	if (!strcmp(device, "udp")) {
+		int sport,dport;
+		char daddr[128];
+			
+		vlan->nb_host_devs++;
+		if (get_param_value(daddr, sizeof(daddr), "dport",p)<=0) {
+			printf ("must specify destination address with daddr=\n");
+			exit(0);
+		}
+		
+		dport=atoi(daddr);
+		if (get_param_value(daddr, sizeof(daddr), "sport",p)<=0) {
+			printf ("must specify destination address with saddr=\n");
+			exit(0);
+		}
+		sport=atoi(daddr);
+		if (get_param_value(daddr, sizeof(daddr), "daddr",p)<=0) {
+			printf ("must specify destination address with daddr=\n");
+			exit(0);
+		}
+		
+		ret = net_dudp_init(vlan, device, name, sport, daddr, dport);
+	} else
+#ifndef _WIN32
+	if (!strcmp(device, "lcap")) {
+		char ifname[64];
+		vlan->nb_host_devs++;
+		
+		if (get_param_value(ifname, sizeof(ifname), "ifname", p)<=0) {
+			ifname[0] = 0;
+		}
+
+		ret = net_lcap_init(vlan, ifname);
+	} else
+#endif
+#ifdef CONFIG_PCAP
+	if (!strcmp(device, "pcap")) {
+		char ifname[128];
+		vlan->nb_host_devs++;
+		
+		if (get_param_value(ifname, sizeof(ifname), "ifname", p)<=0) {
+			ifname[0] = 0;
+		}
+
+		ret = net_pcap_init(vlan, ifname);
+	} else
+#endif
+		if (!strcmp(device, "dump")) {
         int len = 65536;
 
         if (get_param_value(buf, sizeof(buf), "len", p) > 0) {

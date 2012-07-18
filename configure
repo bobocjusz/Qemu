@@ -203,6 +203,7 @@ sdl="yes"
 sdl_x11="no"
 xen="yes"
 pkgversion=""
+pcap="yes"
 
 # OS specific
 if check_define __linux__ ; then
@@ -505,6 +506,8 @@ for opt do
   ;;
   --disable-docs) build_docs="no"
   ;;
+  --disable-pcap) pcap="no"
+  ;;
   *) echo "ERROR: unknown option $opt"; show_help="yes"
   ;;
   esac
@@ -652,6 +655,7 @@ echo "  --disable-aio            disable AIO support"
 echo "  --enable-io-thread       enable IO thread"
 echo "  --disable-blobs          disable installing provided firmware blobs"
 echo "  --kerneldir=PATH         look for kernel includes in PATH"
+echo "  --disable-pcap           disable PCAP support"
 echo ""
 echo "NOTE: The object files are built at the place where configure is launched"
 exit 1
@@ -1373,6 +1377,7 @@ if test "$rt" = "yes" ; then
 fi
 
 if test "$mingw32" = "yes" ; then
+  PCAPLIBS="-lwpcap"
   if test -z "$prefix" ; then
       prefix="c:/Program Files/Qemu"
   fi
@@ -1381,6 +1386,7 @@ if test "$mingw32" = "yes" ; then
   docsuffix=""
   binsuffix=""
 else
+  PCAPLIBS="-lpcap"
   if test -z "$prefix" ; then
       prefix="/usr/local"
   fi
@@ -1388,6 +1394,17 @@ else
   datasuffix="/share/qemu"
   docsuffix="/share/doc/qemu"
   binsuffix="/bin"
+fi
+
+if test "$pcap" = "yes" ; then
+  pcap=no
+  cat > $TMPC << EOF
+#include <pcap.h>
+int main(void) { return pcap_lib_version(); }
+EOF
+  if $cc $ARCH_CFLAGS -o $TMPE $PCAPLIBS $TMPC 2> /dev/null; then
+  pcap=yes
+  fi
 fi
 
 echo "Install prefix    $prefix"
@@ -1453,6 +1470,7 @@ echo "Install blobs     $blobs"
 echo -e "KVM support       $kvm"
 echo "fdt support       $fdt"
 echo "preadv support    $preadv"
+echo "PCAP support      $pcap"
 
 if test $sdl_too_old = "yes"; then
 echo "-> Your SDL version is too old - please upgrade to have SDL support"
@@ -1495,6 +1513,7 @@ echo "LDFLAGS=$LDFLAGS $OS_LDFLAGS $ARCH_LDFLAGS $EXTRA_LDFLAGS" >> $config_host
 echo "EXESUF=$EXESUF" >> $config_host_mak
 echo "PTHREADLIBS=$PTHREADLIBS" >> $config_host_mak
 echo "CLOCKLIBS=$CLOCKLIBS" >> $config_host_mak
+echo "PCAPLIBS=$PCAPLIBS" >> $config_host_mak
 case "$cpu" in
   i386|x86_64|alpha|cris|hppa|ia64|m68k|microbaze|mips|mips64|ppc|ppc64|s390|sparc|sparc64)
     ARCH=$cpu
@@ -1737,6 +1756,9 @@ fi
 if test "$fdt" = "yes" ; then
   echo "#define HAVE_FDT 1" >> $config_host_h
   echo "FDT_LIBS=-lfdt" >> $config_host_mak
+fi
+if test "$pcap" = "yes" ; then
+  echo "#define CONFIG_PCAP 1" >> $config_host_h
 fi
 
 # XXX: suppress that
