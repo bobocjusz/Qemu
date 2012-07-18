@@ -86,7 +86,7 @@ void do_info_usernet(Monitor *mon);
 
 /* NIC info */
 
-#define MAX_NICS 8
+#define MAX_NICS 24
 enum {
 	NIC_NVECTORS_UNSPECIFIED = -1
 };
